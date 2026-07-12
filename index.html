@@ -13,6 +13,7 @@
     color:#fff;user-select:none;-webkit-user-select:none;touch-action:none}
   body{display:flex;align-items:center;justify-content:center}
   #area{position:relative;width:min(100vw,160vh);aspect-ratio:960/600;max-height:100vh}
+  @supports (height:100dvh){ #area{width:min(100vw,160dvh);max-height:100dvh} } /* iOS 工具列 */
   canvas{position:absolute;inset:0;width:100%;height:100%;display:block;border-radius:10px}
 
   /* ---------- 共用 ---------- */
@@ -74,9 +75,10 @@
   #timer{background:rgba(10,14,40,.72);border-radius:12px;padding:4px 16px;
     font-size:clamp(15px,3vmin,22px);font-weight:900;border:2px solid rgba(255,255,255,.15)}
   #timer.sd{color:#ff5b7f;border-color:#ff5b7f;animation:pulse .6s infinite}
-  #leaveBtn{pointer-events:auto;position:absolute;top:8px;right:10px;width:34px;height:34px;
+  #leaveBtn{pointer-events:auto;position:absolute;top:10px;right:62px;width:42px;height:42px;
     border-radius:50%;border:2px solid rgba(255,255,255,.3);background:rgba(10,14,40,.72);
     color:#fff;font-size:16px;font-weight:bold;cursor:pointer;z-index:13}
+  #hud{padding-right:112px} /* 讓右側計分板避開離開/靜音鈕 */
   #muteBtn{position:absolute;top:10px;right:12px;z-index:30;width:42px;height:42px;border-radius:50%;
     border:2px solid rgba(255,255,255,.25);background:rgba(10,14,40,.6);font-size:20px;cursor:pointer}
 
@@ -187,6 +189,11 @@ const $ = s => document.querySelector(s);
 const clamp = (v,a,b) => v<a?a:v>b?b:v;
 const dist2 = (ax,ay,bx,by) => { const dx=ax-bx, dy=ay-by; return dx*dx+dy*dy; };
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+// 網路數值消毒:非有限數一律回退 def,防 NaN 注入
+const num=(v,min,max,def)=>{ v=+v; return Number.isFinite(v)?clamp(v,min,max):def; };
+// localStorage 在「封鎖所有 cookie」等環境會直接拋例外,包一層
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
 
 // ---------- 常數 ----------
 const W=960, H=600, PR=22;            // 場地大小、玩家半徑
@@ -203,7 +210,7 @@ const PU_KINDS=[
 
 // ---------- 音效(WebAudio,無外部檔案)----------
 let AC=null;
-let muted = localStorage.getItem('bb_mute')==='1';
+let muted = lsGet('bb_mute')==='1';
 function ac(){ if(!AC){ const C=window.AudioContext||window.webkitAudioContext; if(!C) return null; AC=new C(); } if(AC.state==='suspended') AC.resume(); return AC; }
 function tone(f0,f1,dur,type,vol,delay){
   if(muted) return; const a=ac(); if(!a) return;
@@ -227,7 +234,7 @@ const sfx={
 };
 $('#muteBtn').textContent = muted?'🔇':'🔊';
 $('#muteBtn').addEventListener('click',()=>{
-  muted=!muted; localStorage.setItem('bb_mute',muted?'1':'0');
+  muted=!muted; lsSet('bb_mute',muted?'1':'0');
   $('#muteBtn').textContent=muted?'🔇':'🔊';
 });
 window.addEventListener('pointerdown',()=>ac(),{once:true});
@@ -235,13 +242,13 @@ window.addEventListener('keydown',()=>ac(),{once:true});
 
 // ---------- 個人資料 ----------
 const profile={
-  name : localStorage.getItem('bb_name')||'',
-  avatar: localStorage.getItem('bb_ava')||AVATARS[0],
+  name : lsGet('bb_name')||'',
+  avatar: lsGet('bb_ava')||AVATARS[0],
 };
 function saveProfile(){
   profile.name = ($('#nameInput').value.trim()||'玩家').slice(0,8);
-  localStorage.setItem('bb_name',profile.name);
-  localStorage.setItem('bb_ava',profile.avatar);
+  lsSet('bb_name',profile.name);
+  lsSet('bb_ava',profile.avatar);
 }
 // 頭像列
 AVATARS.forEach(a=>{
@@ -548,17 +555,22 @@ const ICE={iceServers:[
   {urls:'stun:stun.cloudflare.com:3478'},
 ]};
 let peer=null, conn=null, roomCode='', myIndex=0;
+let netGen=0; // 世代權杖:離開畫面後使尚未執行的非同步回呼失效
 let opp={name:'對手',avatar:'🐼'}, gotOppHi=false, startSent=false;
 let joinTimeout=null;
 function isOnline(){ return mode==='host'||mode==='guest'; }
+let peerCbs=null; // 載入中時排隊,避免重複插入 script
 function loadPeer(cb){
   if(window.Peer) return cb(true);
+  if(peerCbs){ peerCbs.push(cb); return; }
+  peerCbs=[cb];
   let i=0;
+  const done=ok=>{ const cbs=peerCbs||[]; peerCbs=null; cbs.forEach(f=>f(ok)); };
   const next=()=>{
-    if(i>=PEER_URLS.length) return cb(false);
+    if(i>=PEER_URLS.length) return done(false);
     const s=document.createElement('script');
     s.src=PEER_URLS[i++];
-    s.onload=()=>cb(true);
+    s.onload=()=>done(true);
     s.onerror=()=>{ s.remove(); next(); };
     document.head.appendChild(s);
   };
@@ -571,6 +583,7 @@ function genCode(){
 }
 function send(o){ if(conn && conn.open){ try{ conn.send(o); }catch(e){} } }
 function cleanupNet(){
+  netGen++;
   if(joinTimeout){ clearTimeout(joinTimeout); joinTimeout=null; }
   const c=conn, p=peer;
   conn=null; peer=null;
@@ -596,7 +609,9 @@ function hostRoom(){
   showScreen('host');
   $('#roomCode').textContent='····';
   $('#hostStatus').textContent='載入連線元件…';
+  const gen=netGen;
   loadPeer(ok=>{
+    if(gen!==netGen) return; // 使用者已離開此畫面
     if(!ok){ $('#hostStatus').textContent='連線元件載入失敗,請檢查網路後重試'; return; }
     tryHost(0);
   });
@@ -632,7 +647,9 @@ function joinRoom(){
   if(code.length!==4){ $('#joinStatus').textContent='代碼是 4 個字喔!'; return; }
   saveProfile();
   $('#joinStatus').textContent='載入連線元件…';
+  const gen=netGen;
   loadPeer(ok=>{
+    if(gen!==netGen) return; // 使用者已離開加入畫面
     if(!ok){ $('#joinStatus').textContent='連線元件載入失敗,請檢查網路後重試'; return; }
     cleanupNet();
     $('#joinStatus').textContent='連線中…';
@@ -664,7 +681,7 @@ function onMsg(d){
       opp.name=String(d.name||'對手').slice(0,8);
       opp.avatar=AVATARS.includes(d.avatar)?d.avatar:'🐼';
       gotOppHi=true;
-      if(myIndex===0 && !startSent){ // 房主:收到打招呼後開始
+      if(myIndex===0 && !startSent && !isOnline() && state==='menu'){ // 房主:在等待室收到打招呼才開始
         startSent=true;
         setTimeout(()=>{
           if(!conn) return;
@@ -675,37 +692,55 @@ function onMsg(d){
       }
       break;
     case 'start':
-      if(myIndex===1) beginOnlineMatch(d.seed>>>0);
+      // 只在等待室或線上結束畫面接受開始(防殘留連線劫持進行中的單人局)
+      if(myIndex===1 && ((mode===null&&state==='menu') || (isOnline()&&state==='over')))
+        beginOnlineMatch(d.seed>>>0);
       break;
     case 's':{
       if(!isOnline()) break;
       const r=players[1-myIndex]; if(!r) break;
-      r.tx=+d.x; r.ty=+d.y; r.fx=+d.fx||0; r.fy=+d.fy||0; r.moving=!!d.m;
+      const nx=num(d.x,PR,W-PR,NaN), ny=num(d.y,PR,H-PR,NaN);
+      if(Number.isNaN(nx)||Number.isNaN(ny)) break;
+      r.tx=nx; r.ty=ny;
+      r.fx=num(d.fx,-1,1,0); r.fy=num(d.fy,-1,1,0); r.moving=!!d.m;
       break;
     }
-    case 'b':
-      if(state==='play'||state==='countdown')
-        bullets.push({id:d.id, owner:1-myIndex, x:+d.x, y:+d.y, dx:+d.dx, dy:+d.dy, speed:+d.s, rad:+d.r});
+    case 'b':{
+      if(!(state==='play'||state==='countdown')) break;
+      const x=num(d.x,-30,W+30,NaN), y=num(d.y,-30,H+30,NaN);
+      if(Number.isNaN(x)||Number.isNaN(y)) break;
+      bullets.push({id:d.id, owner:1-myIndex, x, y,
+        dx:num(d.dx,-1,1,0), dy:num(d.dy,-1,1,0),
+        speed:num(d.s,50,800,430), rad:num(d.r,2,30,7)});
+      if(bullets.length>80) bullets.splice(0,bullets.length-80); // 訊息洪水保險
       break;
+    }
     case 'hit':{ // 對方回報他被打中
       if(!isOnline()) break;
       const i=bullets.findIndex(b=>b.id===d.bid);
       if(i>=0) bullets.splice(i,1);
-      if(Array.isArray(d.sc)){ players[0].score=d.sc[0]|0; players[1].score=d.sc[1]|0; }
       const v=players[1-myIndex];
-      if(d.sh){ v.shield=Math.max(0,v.shield-1); sfx.shield(); burst(d.x,d.y,'#7ee7ff',8); }
+      if(Array.isArray(d.sc)){
+        players[0].score=num(d.sc[0],0,WIN_SCORE,players[0].score);
+        players[1].score=num(d.sc[1],0,WIN_SCORE,players[1].score);
+      }
+      const hx=num(d.x,0,W,v.x), hy=num(d.y,0,H,v.y);
+      if(d.sh){ v.shield=Math.max(0,v.shield-1); sfx.shield(); burst(hx,hy,'#7ee7ff',8); }
       else{
         v.invUntil=tNow+1.2;
-        sfx.hit(); burst(d.x,d.y,COLORS[myIndex],14);
-        floatText(d.x,d.y-34,'+1',COLORS[myIndex]);
+        sfx.hit(); burst(hx,hy,COLORS[myIndex],14);
+        floatText(hx,hy-34,'+1',COLORS[myIndex]);
       }
       updateHUD(); checkEnd();
       break;
     }
-    case 'pu':
-      if(state==='play'&&!pus.some(u=>u.id===d.id))
-        pus.push({id:d.id,k:d.k,e:emojiOf(d.k),x:+d.x,y:+d.y,born:tNow});
+    case 'pu':{
+      if(state!=='play'||pus.some(u=>u.id===d.id)||pus.length>=6) break;
+      const x=num(d.x,20,W-20,NaN), y=num(d.y,20,H-20,NaN);
+      if(Number.isNaN(x)||Number.isNaN(y)) break;
+      pus.push({id:d.id,k:d.k,e:emojiOf(d.k),x,y,born:tNow});
       break;
+    }
     case 'pt':{ // 對方吃到道具
       const i=pus.findIndex(u=>u.id===d.id);
       if(i>=0){
@@ -718,8 +753,12 @@ function onMsg(d){
     }
     case 'time': // 房主每秒校正時間與比分
       if(myIndex===1 && (state==='play'||state==='countdown')){
-        timeLeft=+d.v;
-        if(Array.isArray(d.sc)){ players[0].score=d.sc[0]|0; players[1].score=d.sc[1]|0; updateHUD(); }
+        timeLeft=num(d.v,0,MATCH_TIME,timeLeft);
+        if(Array.isArray(d.sc)){
+          players[0].score=num(d.sc[0],0,WIN_SCORE,players[0].score);
+          players[1].score=num(d.sc[1],0,WIN_SCORE,players[1].score);
+          updateHUD();
+        }
         if(d.sd && !suddenDeath){ suddenDeath=true; updateHUD(); }
         checkEnd();
       }
@@ -927,7 +966,7 @@ function update(dt){
   for(let i=bullets.length-1;i>=0;i--){
     const b=bullets[i];
     b.x+=b.dx*b.speed*dt; b.y+=b.dy*b.speed*dt;
-    if(b.x<-30||b.x>W+30||b.y<-30||b.y>H+30){ bullets.splice(i,1); continue; }
+    if(!(b.x>=-30&&b.x<=W+30&&b.y>=-30&&b.y<=H+30)){ bullets.splice(i,1); continue; } // 反向寫法讓 NaN 也被移除
     let dead=false;
     for(const o of obstacles){
       if(circleRectOverlap(b.x,b.y,b.rad,o)){ burst(b.x,b.y,'rgba(180,200,255,0.9)',5); dead=true; break; }
@@ -973,6 +1012,7 @@ function update(dt){
 function smoothRemote(dt){
   const r=players[1-myIndex];
   if(!r || r.tx===null) return;
+  if(!Number.isFinite(r.x)||!Number.isFinite(r.y)){ r.x=r.tx; r.y=r.ty; return; } // 自癒
   if(dist2(r.x,r.y,r.tx,r.ty)>180*180){ r.x=r.tx; r.y=r.ty; return; } // 差太多直接跳
   const k=1-Math.exp(-14*dt);
   r.x+=(r.tx-r.x)*k; r.y+=(r.ty-r.y)*k;
@@ -1141,8 +1181,9 @@ function renderMenuBubbles(){
 // ---------- 選單按鈕 ----------
 $('#soloBtn').addEventListener('click',startSolo);
 $('#localBtn').addEventListener('click',()=>{
-  if(isTouch && !window.matchMedia('(pointer:fine)').matches){
-    alert('同機雙人需要鍵盤喔!請在電腦上玩這個模式。');
+  if(!window.matchMedia('(any-pointer:fine)').matches){
+    alert('同機雙人需要實體鍵盤,請在電腦上玩這個模式!');
+    return; // 純觸控裝置別開局,否則會卡在無法操作的畫面
   }
   startLocal();
 });
